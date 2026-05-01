@@ -25,7 +25,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::worker::{ConnectionMode, Worker, UNKNOWN_MODEL_ID};
+use crate::worker::{Worker, UNKNOWN_MODEL_ID};
 
 /// Default jump size for new `PositionalIndexer` instances.
 const DEFAULT_JUMP_SIZE: usize = 64;
@@ -98,11 +98,6 @@ impl KvEventMonitor {
         let url = worker.url().to_string();
         // Normalize model_id to match routing's normalize_model_key — empty → "unknown".
         let model_id = Self::normalize_model_id(worker.model_id());
-
-        if *worker.connection_mode() == ConnectionMode::Http {
-            debug!(worker_url = %url, "HTTP worker, skipping KV event subscription");
-            return;
-        }
 
         let mut handles = self.worker_handles.lock().await;
         if handles.contains_key(&url) {
