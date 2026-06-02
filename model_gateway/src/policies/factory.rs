@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    KvCentricConfig, KvCentricPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -72,6 +72,28 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            PolicyConfig::KvCentric {
+                kv_bytes_per_token,
+                block_size,
+                compute_overhead_ms,
+                compute_slope_ms,
+                pd_overhead_ms,
+                pd_slope_ms_per_mb,
+                service_time_ms,
+                balancing_threshold,
+            } => {
+                let config = KvCentricConfig {
+                    kv_bytes_per_token: *kv_bytes_per_token,
+                    block_size: *block_size,
+                    compute_overhead_ms: *compute_overhead_ms,
+                    compute_slope_ms: *compute_slope_ms,
+                    pd_overhead_ms: *pd_overhead_ms,
+                    pd_slope_ms_per_mb: *pd_slope_ms_per_mb,
+                    service_time_ms: *service_time_ms,
+                    balancing_threshold: *balancing_threshold,
+                };
+                Arc::new(KvCentricPolicy::with_config(config))
+            }
         }
     }
 
@@ -88,6 +110,9 @@ impl PolicyFactory {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            "kv_centric" | "kvcentric" => {
+                Some(Arc::new(KvCentricPolicy::with_config(KvCentricConfig::default())))
+            }
             _ => None,
         }
     }

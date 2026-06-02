@@ -440,6 +440,30 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// KV cache-centric scheduling policy.
+    /// Minimizes estimated TTFT = T_queue + T_compute + T_pd_transfer
+    /// using fitted linear models from benchmark measurements.
+    /// Reuses KV event-driven infrastructure from cache_aware for prefix matching.
+    #[serde(rename = "kv_centric")]
+    KvCentric {
+        #[serde(default = "default_kv_bytes_per_token")]
+        kv_bytes_per_token: usize,
+        #[serde(default = "default_block_size")]
+        block_size: usize,
+        #[serde(default = "default_compute_overhead_ms")]
+        compute_overhead_ms: f64,
+        #[serde(default = "default_compute_slope_ms")]
+        compute_slope_ms: f64,
+        #[serde(default = "default_pd_overhead_ms")]
+        pd_overhead_ms: f64,
+        #[serde(default = "default_pd_slope_ms_per_mb")]
+        pd_slope_ms_per_mb: f64,
+        #[serde(default = "default_service_time_ms")]
+        service_time_ms: f64,
+        #[serde(default = "default_balancing_threshold")]
+        balancing_threshold: u32,
+    },
 }
 
 fn default_block_size() -> usize {
@@ -452,6 +476,28 @@ fn default_prefix_token_count() -> usize {
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_kv_bytes_per_token() -> usize {
+    57344
+}
+fn default_compute_overhead_ms() -> f64 {
+    14.4
+}
+fn default_compute_slope_ms() -> f64 {
+    0.0098
+}
+fn default_pd_overhead_ms() -> f64 {
+    2.2
+}
+fn default_pd_slope_ms_per_mb() -> f64 {
+    0.025
+}
+fn default_service_time_ms() -> f64 {
+    36.0
+}
+fn default_balancing_threshold() -> u32 {
+    4
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {
@@ -473,6 +519,7 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::KvCentric { .. } => "kv_centric",
         }
     }
 }

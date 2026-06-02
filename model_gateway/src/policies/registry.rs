@@ -10,7 +10,10 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, PolicyFactory};
+use super::{
+    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, KvCentricPolicy, LoadBalancingPolicy,
+    PolicyFactory,
+};
 use crate::{
     config::types::PolicyConfig,
     worker::{KvEventMonitor, Worker},
@@ -81,13 +84,15 @@ impl PolicyRegistry {
         }
     }
 
-    /// Inject KV event monitor into a policy if it's cache-aware.
+    /// Inject KV event monitor into a policy if it supports event-driven routing.
     fn maybe_inject_monitor(
         policy: &Arc<dyn LoadBalancingPolicy>,
         monitor: Option<&Arc<KvEventMonitor>>,
     ) {
         if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
             cache_aware.set_kv_event_monitor(monitor.cloned());
+        } else if let Some(kv_centric) = policy.as_any().downcast_ref::<KvCentricPolicy>() {
+            kv_centric.set_kv_event_monitor(monitor.cloned());
         }
     }
 

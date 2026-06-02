@@ -14,6 +14,7 @@ mod cache_aware;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
+mod kv_centric;
 mod manual;
 mod power_of_two;
 mod prefix_hash;
@@ -25,6 +26,7 @@ pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use consistent_hashing::ConsistentHashingPolicy;
+pub use kv_centric::{KvCentricConfig, KvCentricPolicy};
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
 // Re-export PrefixMatchResult from kv_index for production use

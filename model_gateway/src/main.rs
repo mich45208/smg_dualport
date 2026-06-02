@@ -149,7 +149,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket", "kv_centric"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -192,6 +192,34 @@ struct CliArgs {
     #[arg(long, default_value_t = 1.25, help_heading = "Routing Policy")]
     prefix_hash_load_factor: f64,
 
+    /// KV bytes per token for kv_centric policy (0 = auto-detect)
+    #[arg(long, default_value_t = 57344, help_heading = "Routing Policy")]
+    kv_bytes_per_token: usize,
+
+    /// Prefill compute overhead in ms for kv_centric policy
+    #[arg(long, default_value_t = 14.4, help_heading = "Routing Policy")]
+    compute_overhead_ms: f64,
+
+    /// Prefill compute slope (ms per new token) for kv_centric policy
+    #[arg(long, default_value_t = 0.0098, help_heading = "Routing Policy")]
+    compute_slope_ms: f64,
+
+    /// PD transfer overhead in ms for kv_centric policy
+    #[arg(long, default_value_t = 2.2, help_heading = "Routing Policy")]
+    pd_overhead_ms: f64,
+
+    /// PD transfer slope (ms per MB) for kv_centric policy
+    #[arg(long, default_value_t = 0.025, help_heading = "Routing Policy")]
+    pd_slope_ms_per_mb: f64,
+
+    /// Average service time in ms for queue estimation in kv_centric policy
+    #[arg(long, default_value_t = 36.0, help_heading = "Routing Policy")]
+    service_time_ms: f64,
+
+    /// Cache balancing threshold (blocks) for kv_centric policy
+    #[arg(long, default_value_t = 4, help_heading = "Routing Policy")]
+    balancing_threshold: u32,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
@@ -214,11 +242,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket", "kv_centric"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "consistent_hashing", "manual", "bucket", "kv_centric"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Timeout in seconds for worker startup and registration
@@ -956,6 +984,16 @@ impl CliArgs {
                     "min_group" => ManualAssignmentMode::MinGroup,
                     other => panic!("Unknown assignment mode: {other}"),
                 },
+            },
+            "kv_centric" => PolicyConfig::KvCentric {
+                kv_bytes_per_token: self.kv_bytes_per_token,
+                block_size: self.block_size,
+                compute_overhead_ms: self.compute_overhead_ms,
+                compute_slope_ms: self.compute_slope_ms,
+                pd_overhead_ms: self.pd_overhead_ms,
+                pd_slope_ms_per_mb: self.pd_slope_ms_per_mb,
+                service_time_ms: self.service_time_ms,
+                balancing_threshold: self.balancing_threshold,
             },
             _ => PolicyConfig::RoundRobin,
         }
