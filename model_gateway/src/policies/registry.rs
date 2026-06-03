@@ -256,6 +256,11 @@ impl PolicyRegistry {
 
     /// Set the prefill policy for PD mode (lock-free, set once at startup)
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        // Inject the registry's stored KV event monitor (if any) so event-aware
+        // policies registered after with_kv_event_monitor() ran still get it.
+        let monitor_guard = self.kv_event_monitor.read();
+        Self::maybe_inject_monitor(&policy, monitor_guard.as_ref());
+        drop(monitor_guard);
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.prefill_policy.set(policy);
@@ -274,6 +279,11 @@ impl PolicyRegistry {
 
     /// Set the decode policy for PD mode (lock-free, set once at startup)
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        // Same as set_prefill_policy: ensure event-aware policies pick up the
+        // stored monitor even when registered after with_kv_event_monitor().
+        let monitor_guard = self.kv_event_monitor.read();
+        Self::maybe_inject_monitor(&policy, monitor_guard.as_ref());
+        drop(monitor_guard);
         // OnceLock::set returns Err if already set, which we ignore since
         // the policy should only be set once at startup
         let _ = self.decode_policy.set(policy);

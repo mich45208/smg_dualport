@@ -707,23 +707,36 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create KV event monitor for event-driven cache-aware routing.
+    /// Create KV event monitor for event-driven cache-aware / kv-centric routing.
     ///
-    /// The monitor is created when the default policy is cache_aware, regardless
-    /// of connection mode. The monitor itself is cheap (empty DashMaps) and stays
-    /// dormant until workers are added. The UpdatePoliciesStep gates subscriptions
-    /// on `cache_aware && gRPC`, so HTTP workers are never subscribed.
+    /// The monitor is created when ANY of the main, prefill, or decode policies
+    /// is one that consumes KV events (cache_aware or kv_centric). The monitor
+    /// itself is cheap (empty DashMaps) and stays dormant until workers are
+    /// added. The UpdatePoliciesStep gates subscriptions on policy + gRPC, so
+    /// HTTP workers are never subscribed.
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
         use crate::config::types::PolicyConfig;
 
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. });
+        let needs_monitor = |p: &PolicyConfig| {
+            matches!(
+                p,
+                PolicyConfig::CacheAware { .. } | PolicyConfig::KvCentric { .. }
+            )
+        };
 
-        if is_cache_aware {
+        let main = &config.policy;
+        let any_needs = needs_monitor(main)
+            || needs_monitor(config.mode.get_prefill_policy(main))
+            || needs_monitor(config.mode.get_decode_policy(main));
+
+        if any_needs {
             let monitor = Arc::new(KvEventMonitor::new(None));
-            debug!("Created KV event monitor for event-driven cache-aware routing");
+            debug!("Created KV event monitor for event-driven routing");
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
-            // and any other existing cache-aware policies.
+            // and any existing prefill/decode policies, and is stored so that
+            // policies registered later (via set_prefill_policy/set_decode_policy)
+            // also pick it up.
             if let Some(ref registry) = self.policy_registry {
                 registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
             }

@@ -29,6 +29,7 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
         "prefix_hash": PolicyType.PrefixHash,
+        "kv_centric": PolicyType.KvCentric,
     }
     return policy_map[policy_str]
 

@@ -466,6 +466,31 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::KvCentric {
+                kv_bytes_per_token,
+                block_size,
+                compute_overhead_ms: _,
+                compute_slope_ms: _,
+                pd_overhead_ms: _,
+                pd_slope_ms_per_mb: _,
+                service_time_ms: _,
+                balancing_threshold: _,
+            } => {
+                if *block_size == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "block_size".to_string(),
+                        value: block_size.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *kv_bytes_per_token == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "kv_bytes_per_token".to_string(),
+                        value: kv_bytes_per_token.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }

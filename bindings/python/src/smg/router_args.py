@@ -18,6 +18,7 @@ COMMON_POLICY_CHOICES = [
     "manual",
     "consistent_hashing",
     "prefix_hash",
+    "kv_centric",
 ]
 
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
@@ -54,6 +55,14 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
+    # kv_centric policy tuning parameters (TTFT-minimizing scheduler)
+    kv_bytes_per_token: int = 57344
+    compute_overhead_ms: float = 14.4
+    compute_slope_ms: float = 0.0098
+    pd_overhead_ms: float = 2.2
+    pd_slope_ms_per_mb: float = 0.025
+    service_time_ms: float = 36.0
+    balancing_threshold: int = 4
     dp_aware: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
@@ -394,6 +403,49 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_payload_size,
             help="Maximum payload size in bytes",
+        )
+        # kv_centric policy tuning args
+        routing_group.add_argument(
+            f"--{prefix}kv-bytes-per-token",
+            type=int,
+            default=RouterArgs.kv_bytes_per_token,
+            help="kv_centric: KV bytes per token (0 = auto-detect)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}compute-overhead-ms",
+            type=float,
+            default=RouterArgs.compute_overhead_ms,
+            help="kv_centric: Prefill compute overhead in ms",
+        )
+        routing_group.add_argument(
+            f"--{prefix}compute-slope-ms",
+            type=float,
+            default=RouterArgs.compute_slope_ms,
+            help="kv_centric: Prefill compute slope (ms per new token)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}pd-overhead-ms",
+            type=float,
+            default=RouterArgs.pd_overhead_ms,
+            help="kv_centric: PD transfer overhead in ms",
+        )
+        routing_group.add_argument(
+            f"--{prefix}pd-slope-ms-per-mb",
+            type=float,
+            default=RouterArgs.pd_slope_ms_per_mb,
+            help="kv_centric: PD transfer slope (ms per MB)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}service-time-ms",
+            type=float,
+            default=RouterArgs.service_time_ms,
+            help="kv_centric: Average service time in ms for queue estimation",
+        )
+        routing_group.add_argument(
+            f"--{prefix}balancing-threshold",
+            type=int,
+            default=RouterArgs.balancing_threshold,
+            help="kv_centric: Cache balancing threshold (blocks)",
         )
         routing_group.add_argument(
             f"--{prefix}dp-aware",
