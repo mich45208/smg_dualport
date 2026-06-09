@@ -1,24 +1,42 @@
 use std::collections::HashMap;
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use rand::{distr::Alphanumeric, Rng};
-use smg::{
-    config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
-        TokenizerCacheConfig, TraceConfig,
-    },
-    observability::{
-        metrics::PrometheusConfig,
-        otel_trace::{is_otel_enabled, shutdown_otel},
-    },
-    server::{self, ServerConfig},
-    service_discovery::{ModelIdSource, ServiceDiscoveryConfig},
-    version,
-    worker::ConnectionMode,
-};
-use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
+use clap::ArgAction;
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
+use rand::Rng;
+use rand::distr::Alphanumeric;
+use smg::config::CircuitBreakerConfig;
+use smg::config::ConfigError;
+use smg::config::ConfigResult;
+use smg::config::DiscoveryConfig;
+use smg::config::HealthCheckConfig;
+use smg::config::HistoryBackend;
+use smg::config::ManualAssignmentMode;
+use smg::config::MetricsConfig;
+use smg::config::OracleConfig;
+use smg::config::PolicyConfig;
+use smg::config::PostgresConfig;
+use smg::config::RedisConfig;
+use smg::config::RetryConfig;
+use smg::config::RouterConfig;
+use smg::config::RoutingMode;
+use smg::config::SchemaConfig;
+use smg::config::TokenizerCacheConfig;
+use smg::config::TraceConfig;
+use smg::observability::metrics::PrometheusConfig;
+use smg::observability::otel_trace::is_otel_enabled;
+use smg::observability::otel_trace::shutdown_otel;
+use smg::server::ServerConfig;
+use smg::server::{self};
+use smg::service_discovery::ModelIdSource;
+use smg::service_discovery::ServiceDiscoveryConfig;
+use smg::version;
+use smg::worker::ConnectionMode;
+use smg_auth::ApiKeyEntry;
+use smg_auth::ControlPlaneAuthConfig;
+use smg_auth::JwtConfig;
+use smg_auth::Role;
 use smg_mesh::MeshServerConfig;
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
@@ -193,31 +211,35 @@ struct CliArgs {
     prefix_hash_load_factor: f64,
 
     /// KV bytes per token for kv_centric policy (0 = auto-detect)
-    #[arg(long, default_value_t = 57344, help_heading = "Routing Policy")]
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::KV_BYTES_PER_TOKEN, help_heading = "Routing Policy")]
     kv_bytes_per_token: usize,
 
-    /// Prefill compute overhead in ms for kv_centric policy
-    #[arg(long, default_value_t = 14.4, help_heading = "Routing Policy")]
+    /// kv_centric: isolated single-request compute overhead (ms)
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::COMPUTE_OVERHEAD_MS, help_heading = "Routing Policy")]
     compute_overhead_ms: f64,
 
-    /// Prefill compute slope (ms per new token) for kv_centric policy
-    #[arg(long, default_value_t = 0.0098, help_heading = "Routing Policy")]
+    /// kv_centric: per-token compute slope (ms/token; also per-concurrency scaling)
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::COMPUTE_SLOPE_MS, help_heading = "Routing Policy")]
     compute_slope_ms: f64,
 
-    /// PD transfer overhead in ms for kv_centric policy
-    #[arg(long, default_value_t = 2.2, help_heading = "Routing Policy")]
-    pd_overhead_ms: f64,
+    /// kv_centric: attention quadratic term (ms/token^2, single-request only)
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::COMPUTE_QUAD_MS, help_heading = "Routing Policy")]
+    compute_quad_ms: f64,
 
-    /// PD transfer slope (ms per MB) for kv_centric policy
-    #[arg(long, default_value_t = 0.025, help_heading = "Routing Policy")]
-    pd_slope_ms_per_mb: f64,
+    /// kv_centric: serialized-batch compute overhead (ms) under load
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::LOAD_OVERHEAD_MS, help_heading = "Routing Policy")]
+    load_overhead_ms: f64,
 
-    /// Average service time in ms for queue estimation in kv_centric policy
-    #[arg(long, default_value_t = 36.0, help_heading = "Routing Policy")]
-    service_time_ms: f64,
+    /// kv_centric: L3 read per-pull fixed overhead (ms, master RPC)
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::L3_READ_OVERHEAD_MS, help_heading = "Routing Policy")]
+    l3_read_overhead_ms: f64,
+
+    /// kv_centric: L3 read cost per cached token pulled (ms/token, ~57 GiB/s)
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::L3_READ_PER_TOKEN_MS, help_heading = "Routing Policy")]
+    l3_read_per_token_ms: f64,
 
     /// Cache balancing threshold (blocks) for kv_centric policy
-    #[arg(long, default_value_t = 4, help_heading = "Routing Policy")]
+    #[arg(long, default_value_t = smg::policies::kv_centric::defaults::BALANCING_THRESHOLD, help_heading = "Routing Policy")]
     balancing_threshold: u32,
 
     /// Enable data parallelism aware scheduling
@@ -839,11 +861,15 @@ impl CliArgs {
                 Some(jwt_config)
             }
             (Some(_), None) => {
-                eprintln!("WARNING: --jwt-issuer provided but --jwt-audience is missing. JWT auth disabled.");
+                eprintln!(
+                    "WARNING: --jwt-issuer provided but --jwt-audience is missing. JWT auth disabled."
+                );
                 None
             }
             (None, Some(_)) => {
-                eprintln!("WARNING: --jwt-audience provided but --jwt-issuer is missing. JWT auth disabled.");
+                eprintln!(
+                    "WARNING: --jwt-audience provided but --jwt-issuer is missing. JWT auth disabled."
+                );
                 None
             }
             (None, None) => None,
@@ -990,9 +1016,10 @@ impl CliArgs {
                 block_size: self.block_size,
                 compute_overhead_ms: self.compute_overhead_ms,
                 compute_slope_ms: self.compute_slope_ms,
-                pd_overhead_ms: self.pd_overhead_ms,
-                pd_slope_ms_per_mb: self.pd_slope_ms_per_mb,
-                service_time_ms: self.service_time_ms,
+                compute_quad_ms: self.compute_quad_ms,
+                load_overhead_ms: self.load_overhead_ms,
+                l3_read_overhead_ms: self.l3_read_overhead_ms,
+                l3_read_per_token_ms: self.l3_read_per_token_ms,
                 balancing_threshold: self.balancing_threshold,
             },
             _ => PolicyConfig::RoundRobin,

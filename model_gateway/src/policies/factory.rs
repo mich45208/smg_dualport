@@ -2,11 +2,21 @@
 
 use std::sync::Arc;
 
-use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    KvCentricConfig, KvCentricPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
-    PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
-};
+use super::BucketConfig;
+use super::BucketPolicy;
+use super::CacheAwareConfig;
+use super::CacheAwarePolicy;
+use super::ConsistentHashingPolicy;
+use super::KvCentricConfig;
+use super::KvCentricPolicy;
+use super::LoadBalancingPolicy;
+use super::ManualConfig;
+use super::ManualPolicy;
+use super::PowerOfTwoPolicy;
+use super::PrefixHashConfig;
+use super::PrefixHashPolicy;
+use super::RandomPolicy;
+use super::RoundRobinPolicy;
 use crate::config::PolicyConfig;
 
 /// Factory for creating policy instances
@@ -77,21 +87,26 @@ impl PolicyFactory {
                 block_size,
                 compute_overhead_ms,
                 compute_slope_ms,
-                pd_overhead_ms,
-                pd_slope_ms_per_mb,
-                service_time_ms,
+                compute_quad_ms,
+                load_overhead_ms,
+                l3_read_overhead_ms,
+                l3_read_per_token_ms,
                 balancing_threshold,
             } => {
-                let config = KvCentricConfig {
+                let mut config = KvCentricConfig {
                     kv_bytes_per_token: *kv_bytes_per_token,
                     block_size: *block_size,
                     compute_overhead_ms: *compute_overhead_ms,
                     compute_slope_ms: *compute_slope_ms,
-                    pd_overhead_ms: *pd_overhead_ms,
-                    pd_slope_ms_per_mb: *pd_slope_ms_per_mb,
-                    service_time_ms: *service_time_ms,
+                    compute_quad_ms: *compute_quad_ms,
+                    load_overhead_ms: *load_overhead_ms,
+                    l3_read_overhead_ms: *l3_read_overhead_ms,
+                    l3_read_per_token_ms: *l3_read_per_token_ms,
                     balancing_threshold: *balancing_threshold,
                 };
+                // Runtime override: SMG_KV_CENTRIC_CONFIG=<path.json> overrides any of
+                // the above coefficients without a recompile (k8s ConfigMap-friendly).
+                config.apply_env_overrides();
                 Arc::new(KvCentricPolicy::with_config(config))
             }
         }
@@ -111,7 +126,9 @@ impl PolicyFactory {
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
             "kv_centric" | "kvcentric" => {
-                Some(Arc::new(KvCentricPolicy::with_config(KvCentricConfig::default())))
+                let mut config = KvCentricConfig::default();
+                config.apply_env_overrides();
+                Some(Arc::new(KvCentricPolicy::with_config(config)))
             }
             _ => None,
         }

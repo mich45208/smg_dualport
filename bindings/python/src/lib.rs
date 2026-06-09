@@ -410,9 +410,10 @@ struct Router {
     kv_bytes_per_token: usize,
     compute_overhead_ms: f64,
     compute_slope_ms: f64,
-    pd_overhead_ms: f64,
-    pd_slope_ms_per_mb: f64,
-    service_time_ms: f64,
+    compute_quad_ms: f64,
+    load_overhead_ms: f64,
+    l3_read_overhead_ms: f64,
+    l3_read_per_token_ms: f64,
     balancing_threshold: u32,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
@@ -505,9 +506,10 @@ impl Router {
     }
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
-        use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
-        };
+        use config::DiscoveryConfig;
+        use config::MetricsConfig;
+        use config::PolicyConfig as ConfigPolicyConfig;
+        use config::RoutingMode;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -555,9 +557,10 @@ impl Router {
                     block_size: self.block_size,
                     compute_overhead_ms: self.compute_overhead_ms,
                     compute_slope_ms: self.compute_slope_ms,
-                    pd_overhead_ms: self.pd_overhead_ms,
-                    pd_slope_ms_per_mb: self.pd_slope_ms_per_mb,
-                    service_time_ms: self.service_time_ms,
+                    compute_quad_ms: self.compute_quad_ms,
+                    load_overhead_ms: self.load_overhead_ms,
+                    l3_read_overhead_ms: self.l3_read_overhead_ms,
+                    l3_read_per_token_ms: self.l3_read_per_token_ms,
                     balancing_threshold: self.balancing_threshold,
                 },
             })
@@ -818,13 +821,14 @@ impl Router {
         storage_context_headers = HashMap::new(),
         pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
-        kv_bytes_per_token = 57344,
-        compute_overhead_ms = 14.4,
-        compute_slope_ms = 0.0098,
-        pd_overhead_ms = 2.2,
-        pd_slope_ms_per_mb = 0.025,
-        service_time_ms = 36.0,
-        balancing_threshold = 4,
+        kv_bytes_per_token = smg::policies::kv_centric::defaults::KV_BYTES_PER_TOKEN,
+        compute_overhead_ms = smg::policies::kv_centric::defaults::COMPUTE_OVERHEAD_MS,
+        compute_slope_ms = smg::policies::kv_centric::defaults::COMPUTE_SLOPE_MS,
+        compute_quad_ms = smg::policies::kv_centric::defaults::COMPUTE_QUAD_MS,
+        load_overhead_ms = smg::policies::kv_centric::defaults::LOAD_OVERHEAD_MS,
+        l3_read_overhead_ms = smg::policies::kv_centric::defaults::L3_READ_OVERHEAD_MS,
+        l3_read_per_token_ms = smg::policies::kv_centric::defaults::L3_READ_PER_TOKEN_MS,
+        balancing_threshold = smg::policies::kv_centric::defaults::BALANCING_THRESHOLD,
         prefill_urls = None,
         decode_urls = None,
         prefill_policy = None,
@@ -938,9 +942,10 @@ impl Router {
         kv_bytes_per_token: usize,
         compute_overhead_ms: f64,
         compute_slope_ms: f64,
-        pd_overhead_ms: f64,
-        pd_slope_ms_per_mb: f64,
-        service_time_ms: f64,
+        compute_quad_ms: f64,
+        load_overhead_ms: f64,
+        l3_read_overhead_ms: f64,
+        l3_read_per_token_ms: f64,
         balancing_threshold: u32,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
@@ -1064,9 +1069,10 @@ impl Router {
             kv_bytes_per_token,
             compute_overhead_ms,
             compute_slope_ms,
-            pd_overhead_ms,
-            pd_slope_ms_per_mb,
-            service_time_ms,
+            compute_quad_ms,
+            load_overhead_ms,
+            l3_read_overhead_ms,
+            l3_read_per_token_ms,
             balancing_threshold,
             prefill_urls,
             decode_urls,

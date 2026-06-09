@@ -3,18 +3,20 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
+use std::sync::Arc;
 
 use openai_protocol::worker::WorkerLoadResponse;
 
-use crate::worker::{HashRing, Worker};
+use crate::worker::HashRing;
+use crate::worker::Worker;
 
 mod bucket;
 mod cache_aware;
 mod consistent_hashing;
 mod dp_min_token;
 mod factory;
-mod kv_centric;
+pub mod kv_centric;
 mod manual;
 mod power_of_two;
 mod prefix_hash;
@@ -24,16 +26,21 @@ mod round_robin;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
-pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware::TreeHandle;
+pub use cache_aware::TreeKind;
 pub use consistent_hashing::ConsistentHashingPolicy;
-pub use kv_centric::{KvCentricConfig, KvCentricPolicy};
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
+pub use kv_centric::KvCentricConfig;
+pub use kv_centric::KvCentricPolicy;
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
-pub use manual::{ManualConfig, ManualPolicy};
+pub use manual::ManualConfig;
+pub use manual::ManualPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
-pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
+pub use prefix_hash::PrefixHashConfig;
+pub use prefix_hash::PrefixHashPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
@@ -178,10 +185,12 @@ pub struct SelectWorkerInfo<'a> {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::WorkerType;
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {

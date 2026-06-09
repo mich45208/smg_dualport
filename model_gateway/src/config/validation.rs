@@ -471,9 +471,10 @@ impl ConfigValidator {
                 block_size,
                 compute_overhead_ms: _,
                 compute_slope_ms: _,
-                pd_overhead_ms: _,
-                pd_slope_ms_per_mb: _,
-                service_time_ms: _,
+                compute_quad_ms: _,
+                load_overhead_ms: _,
+                l3_read_overhead_ms: _,
+                l3_read_per_token_ms: _,
                 balancing_threshold: _,
             } => {
                 if *block_size == 0 {
@@ -1358,9 +1359,11 @@ mod tests {
         config.skills_enabled = true;
 
         let error = ConfigValidator::validate(&config).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("skills are enabled but no skills config was provided"));
+        assert!(
+            error
+                .to_string()
+                .contains("skills are enabled but no skills config was provided")
+        );
     }
 
     #[test]
@@ -1377,9 +1380,11 @@ mod tests {
         config.skills = Some(skills);
 
         let error = ConfigValidator::validate(&config).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("skills.execution.executor_api_key is missing"));
+        assert!(
+            error
+                .to_string()
+                .contains("skills.execution.executor_api_key is missing")
+        );
     }
 
     #[test]

@@ -55,13 +55,16 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
-    # kv_centric policy tuning parameters (TTFT-minimizing scheduler)
+    # kv_centric policy tuning parameters (TTFT-minimizing scheduler).
+    # SOURCE OF TRUTH: model_gateway/src/policies/kv_centric.rs `mod defaults`.
+    # Python cannot import Rust consts; KEEP THESE IN SYNC with that module.
     kv_bytes_per_token: int = 57344
-    compute_overhead_ms: float = 14.4
-    compute_slope_ms: float = 0.0098
-    pd_overhead_ms: float = 2.2
-    pd_slope_ms_per_mb: float = 0.025
-    service_time_ms: float = 36.0
+    compute_overhead_ms: float = 14.8
+    compute_slope_ms: float = 0.00464
+    compute_quad_ms: float = 4.75e-7
+    load_overhead_ms: float = 14.9
+    l3_read_overhead_ms: float = 0.215
+    l3_read_per_token_ms: float = 0.000937
     balancing_threshold: int = 4
     dp_aware: bool = False
     dp_minimum_tokens_scheduler: bool = False
@@ -415,31 +418,37 @@ class RouterArgs:
             f"--{prefix}compute-overhead-ms",
             type=float,
             default=RouterArgs.compute_overhead_ms,
-            help="kv_centric: Prefill compute overhead in ms",
+            help="kv_centric: isolated single-request compute overhead (ms)",
         )
         routing_group.add_argument(
             f"--{prefix}compute-slope-ms",
             type=float,
             default=RouterArgs.compute_slope_ms,
-            help="kv_centric: Prefill compute slope (ms per new token)",
+            help="kv_centric: per-token compute slope (ms/token; also per-concurrency scaling)",
         )
         routing_group.add_argument(
-            f"--{prefix}pd-overhead-ms",
+            f"--{prefix}compute-quad-ms",
             type=float,
-            default=RouterArgs.pd_overhead_ms,
-            help="kv_centric: PD transfer overhead in ms",
+            default=RouterArgs.compute_quad_ms,
+            help="kv_centric: attention quadratic term (ms/token^2, single-request only)",
         )
         routing_group.add_argument(
-            f"--{prefix}pd-slope-ms-per-mb",
+            f"--{prefix}load-overhead-ms",
             type=float,
-            default=RouterArgs.pd_slope_ms_per_mb,
-            help="kv_centric: PD transfer slope (ms per MB)",
+            default=RouterArgs.load_overhead_ms,
+            help="kv_centric: serialized-batch compute overhead (ms) under load",
         )
         routing_group.add_argument(
-            f"--{prefix}service-time-ms",
+            f"--{prefix}l3-read-overhead-ms",
             type=float,
-            default=RouterArgs.service_time_ms,
-            help="kv_centric: Average service time in ms for queue estimation",
+            default=RouterArgs.l3_read_overhead_ms,
+            help="kv_centric: L3 read per-pull fixed overhead (ms, master RPC)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}l3-read-per-token-ms",
+            type=float,
+            default=RouterArgs.l3_read_per_token_ms,
+            help="kv_centric: L3 read cost per cached token pulled (ms/token, ~57 GiB/s)",
         )
         routing_group.add_argument(
             f"--{prefix}balancing-threshold",
@@ -769,13 +778,17 @@ class RouterArgs:
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
-            help=("Number of consecutive health check failures before marking worker unhealthy"),
+            help=(
+                "Number of consecutive health check failures before marking worker unhealthy"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-success-threshold",
             type=int,
             default=RouterArgs.health_success_threshold,
-            help=("Number of consecutive health check successes before marking worker healthy"),
+            help=(
+                "Number of consecutive health check successes before marking worker healthy"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-timeout-secs",
@@ -957,7 +970,9 @@ class RouterArgs:
         oracle_group.add_argument(
             f"--{prefix}oracle-pool-timeout-secs",
             type=int,
-            default=int(os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)),
+            default=int(
+                os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
+            ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
 
@@ -991,7 +1006,9 @@ class RouterArgs:
         redis_group.add_argument(
             f"--{prefix}redis-retention-days",
             type=int,
-            default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
+            default=int(
+                os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)
+            ),
             help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
         )
 
@@ -1165,7 +1182,9 @@ class RouterArgs:
         )
 
     @classmethod
-    def from_cli_args(cls, args: argparse.Namespace, use_router_prefix: bool = False) -> RouterArgs:
+    def from_cli_args(
+        cls, args: argparse.Namespace, use_router_prefix: bool = False
+    ) -> RouterArgs:
         """
         Create RouterArgs instance from parsed command line arguments.
 
@@ -1176,7 +1195,9 @@ class RouterArgs:
         prefix = "router_" if use_router_prefix else ""
         cli_args_dict = vars(args)
         args_dict = {}
-        disable_arg_fallback = bool(cli_args_dict.get(f"{prefix}disable_arg_fallback", False))
+        disable_arg_fallback = bool(
+            cli_args_dict.get(f"{prefix}disable_arg_fallback", False)
+        )
 
         for attr in dataclasses.fields(cls):
             # Auto strip prefix from args.
@@ -1185,7 +1206,10 @@ class RouterArgs:
             # (e.g. --model-path from the backend) when the prefixed key
             # exists but is None (argparse default).
             prefixed_key = f"{prefix}{attr.name}"
-            if prefixed_key in cli_args_dict and cli_args_dict[prefixed_key] is not None:
+            if (
+                prefixed_key in cli_args_dict
+                and cli_args_dict[prefixed_key] is not None
+            ):
                 args_dict[attr.name] = cli_args_dict[prefixed_key]
             elif (
                 not disable_arg_fallback
@@ -1214,7 +1238,9 @@ class RouterArgs:
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
         )
-        args_dict["selector"] = cls._parse_selector(cli_args_dict.get(f"{prefix}selector", None))
+        args_dict["selector"] = cls._parse_selector(
+            cli_args_dict.get(f"{prefix}selector", None)
+        )
         args_dict["prefill_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}prefill_selector", None)
         )

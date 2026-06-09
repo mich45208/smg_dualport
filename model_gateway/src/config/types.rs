@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 // Re-export storage config types from data_connector
 pub use smg_data_connector::{
     HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
-use super::{validation::ConfigValidator, ConfigResult, SkillsConfig};
-use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
+use super::ConfigResult;
+use super::SkillsConfig;
+use super::validation::ConfigValidator;
+use crate::tenant::DEFAULT_TENANT_HEADER_NAME;
+use crate::worker::ConnectionMode;
 
 /// Runtime feature flags for memory behavior.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,8 +446,10 @@ pub enum PolicyConfig {
     },
 
     /// KV cache-centric scheduling policy.
-    /// Minimizes estimated TTFT = T_queue + T_compute + T_pd_transfer
-    /// using fitted linear models from benchmark measurements.
+    /// Minimizes estimated TTFT = T_compute(c, n_uncached) + T_l3_read(n_pulled),
+    /// using empirically-calibrated load-aware models. The queue wait is folded
+    /// into T_compute (continuous-batching contention shows up in the forward
+    /// pass, not a separate queue); the PD write is async and excluded.
     /// Reuses KV event-driven infrastructure from cache_aware for prefix matching.
     #[serde(rename = "kv_centric")]
     KvCentric {
@@ -455,12 +461,14 @@ pub enum PolicyConfig {
         compute_overhead_ms: f64,
         #[serde(default = "default_compute_slope_ms")]
         compute_slope_ms: f64,
-        #[serde(default = "default_pd_overhead_ms")]
-        pd_overhead_ms: f64,
-        #[serde(default = "default_pd_slope_ms_per_mb")]
-        pd_slope_ms_per_mb: f64,
-        #[serde(default = "default_service_time_ms")]
-        service_time_ms: f64,
+        #[serde(default = "default_compute_quad_ms")]
+        compute_quad_ms: f64,
+        #[serde(default = "default_load_overhead_ms")]
+        load_overhead_ms: f64,
+        #[serde(default = "default_l3_read_overhead_ms")]
+        l3_read_overhead_ms: f64,
+        #[serde(default = "default_l3_read_per_token_ms")]
+        l3_read_per_token_ms: f64,
         #[serde(default = "default_balancing_threshold")]
         balancing_threshold: u32,
     },
@@ -478,26 +486,31 @@ fn default_load_factor() -> f64 {
     1.25
 }
 
+// kv_centric coefficient defaults reference the single source of truth in
+// `crate::policies::kv_centric::defaults` so they cannot drift.
 fn default_kv_bytes_per_token() -> usize {
-    57344
+    crate::policies::kv_centric::defaults::KV_BYTES_PER_TOKEN
 }
 fn default_compute_overhead_ms() -> f64 {
-    14.4
+    crate::policies::kv_centric::defaults::COMPUTE_OVERHEAD_MS
 }
 fn default_compute_slope_ms() -> f64 {
-    0.0098
+    crate::policies::kv_centric::defaults::COMPUTE_SLOPE_MS
 }
-fn default_pd_overhead_ms() -> f64 {
-    2.2
+fn default_compute_quad_ms() -> f64 {
+    crate::policies::kv_centric::defaults::COMPUTE_QUAD_MS
 }
-fn default_pd_slope_ms_per_mb() -> f64 {
-    0.025
+fn default_load_overhead_ms() -> f64 {
+    crate::policies::kv_centric::defaults::LOAD_OVERHEAD_MS
 }
-fn default_service_time_ms() -> f64 {
-    36.0
+fn default_l3_read_overhead_ms() -> f64 {
+    crate::policies::kv_centric::defaults::L3_READ_OVERHEAD_MS
+}
+fn default_l3_read_per_token_ms() -> f64 {
+    crate::policies::kv_centric::defaults::L3_READ_PER_TOKEN_MS
 }
 fn default_balancing_threshold() -> u32 {
-    4
+    crate::policies::kv_centric::defaults::BALANCING_THRESHOLD
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {
