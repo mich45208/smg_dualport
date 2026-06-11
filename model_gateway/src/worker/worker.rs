@@ -1,30 +1,38 @@
-use std::{
-    any::Any,
-    fmt,
-    sync::{
-        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::any::Any;
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::body::Body;
+use openai_protocol::model_card::ModelCard;
+use openai_protocol::model_type::Endpoint;
+use openai_protocol::model_type::ModelType;
+use openai_protocol::worker::HealthCheckConfig;
+use openai_protocol::worker::ProviderType;
+use openai_protocol::worker::WorkerInfo;
+use openai_protocol::worker::WorkerModels;
+use openai_protocol::worker::WorkerSpec;
+use openai_protocol::worker::WorkerStatus;
 // Re-export protocol types as the canonical types for the gateway
 pub use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerType};
-use openai_protocol::{
-    model_card::ModelCard,
-    model_type::{Endpoint, ModelType},
-    worker::{HealthCheckConfig, ProviderType, WorkerInfo, WorkerModels, WorkerSpec, WorkerStatus},
-};
-use tokio::{sync::OnceCell, time};
+use tokio::sync::OnceCell;
+use tokio::time;
 
-use super::{CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    routers::{common::header_utils::extract_routing_key, grpc::client::GrpcClient},
-};
+use super::CircuitBreaker;
+use super::ResolvedResilience;
+use super::UNKNOWN_MODEL_ID;
+use super::WorkerError;
+use super::WorkerResult;
+use crate::observability::metrics::Metrics;
+use crate::observability::metrics::metrics_labels;
+use crate::routers::common::header_utils::extract_routing_key;
+use crate::routers::grpc::client::GrpcClient;
 
 /// Default HTTP client timeout for worker requests (in seconds)
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
@@ -191,6 +199,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Decrement the load counter
     fn decrement_load(&self);
+
+    /// Prefill in-flight reservation (queue + executing prefill) used by kv_centric
+    /// as the queue-depth signal. Default no-op/0 so non-tracking workers are unaffected.
+    fn prefill_inflight(&self) -> usize {
+        0
+    }
+    /// Reserve a prefill slot at SELECTION time (see WorkerRuntime::prefill_inflight).
+    fn increment_prefill_inflight(&self) {}
+    /// Release the reservation when the request leaves prefill (or on abort).
+    fn decrement_prefill_inflight(&self) {}
 
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
@@ -589,6 +607,11 @@ pub struct WorkerRuntime {
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
     load_counter: AtomicUsize,
+    // Prefill in-flight reservation: requests assigned to this worker that have not
+    // yet left prefill (queue + executing prefill). Incremented at SELECTION (so
+    // concurrent routing decisions see each other -> avoids the stale-load herd) and
+    // decremented when the request leaves prefill. Used by kv_centric as queue depth.
+    prefill_inflight: AtomicUsize,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
@@ -602,6 +625,7 @@ impl WorkerRuntime {
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
+            prefill_inflight: AtomicUsize::new(0),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
@@ -670,6 +694,25 @@ impl WorkerRuntime {
     /// `false` if it was already zero — callers can log when that happens.
     pub fn try_decrement_load(&self) -> bool {
         self.load_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    // ── Prefill in-flight (queue + executing prefill) ────────────────
+
+    pub fn prefill_inflight(&self) -> usize {
+        self.prefill_inflight.load(Ordering::Relaxed)
+    }
+
+    pub fn increment_prefill_inflight(&self) {
+        self.prefill_inflight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Saturating decrement. Returns `true` if decremented, `false` if already 0.
+    pub fn try_decrement_prefill_inflight(&self) -> bool {
+        self.prefill_inflight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_sub(1)
             })
@@ -879,6 +922,19 @@ impl Worker for BasicWorker {
             );
         }
         self.update_running_requests_metrics();
+    }
+
+    fn prefill_inflight(&self) -> usize {
+        self.runtime.load().prefill_inflight()
+    }
+
+    fn increment_prefill_inflight(&self) {
+        self.runtime.load().increment_prefill_inflight();
+    }
+
+    fn decrement_prefill_inflight(&self) {
+        // saturating: ignore underflow (e.g. a non-kv_centric request that never reserved)
+        let _ = self.runtime.load().try_decrement_prefill_inflight();
     }
 
     fn routing_key_load(&self) -> usize {
@@ -1188,15 +1244,15 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::thread;
+    use std::time::Duration;
 
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
-    use crate::worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder,
-    };
+    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::circuit_breaker::CircuitBreakerConfig;
+    use crate::worker::circuit_breaker::CircuitState;
 
     /// Health config that skips health checks — workers start Ready immediately.
     /// Use in tests that don't test the health check lifecycle.

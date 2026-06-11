@@ -7,29 +7,35 @@
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
-use llm_tokenizer::{stop::StopSequenceDecoder, traits::Tokenizer, TokenizerRegistry};
-use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatCompletionResponse},
-    classify::{ClassifyRequest, ClassifyResponse},
-    completion::{CompletionRequest, CompletionResponse},
-    embedding::{EmbeddingRequest, EmbeddingResponse},
-    generate::{GenerateRequest, GenerateResponse},
-    messages::{CreateMessageRequest, Message},
-    responses::ResponsesRequest,
-};
+use llm_tokenizer::TokenizerRegistry;
+use llm_tokenizer::stop::StopSequenceDecoder;
+use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::chat::ChatCompletionRequest;
+use openai_protocol::chat::ChatCompletionResponse;
+use openai_protocol::classify::ClassifyRequest;
+use openai_protocol::classify::ClassifyResponse;
+use openai_protocol::completion::CompletionRequest;
+use openai_protocol::completion::CompletionResponse;
+use openai_protocol::embedding::EmbeddingRequest;
+use openai_protocol::embedding::EmbeddingResponse;
+use openai_protocol::generate::GenerateRequest;
+use openai_protocol::generate::GenerateResponse;
+use openai_protocol::messages::CreateMessageRequest;
+use openai_protocol::messages::Message;
+use openai_protocol::responses::ResponsesRequest;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
-use super::{
-    client::GrpcClient,
-    multimodal::MultimodalComponents,
-    proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
-};
-use crate::{
-    middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard},
-};
+use super::client::GrpcClient;
+use super::multimodal::MultimodalComponents;
+use super::proto_wrapper::ProtoEmbedComplete;
+use super::proto_wrapper::ProtoRequest;
+use super::proto_wrapper::ProtoStream;
+use crate::middleware::TenantRequestMeta;
+use crate::worker::RuntimeType;
+use crate::worker::Worker;
+use crate::worker::WorkerLoadGuard;
 
 /// Main request processing context
 ///
@@ -126,8 +132,40 @@ pub(crate) struct ProcessingState {
     // Load guard for worker load tracking (created at execution stage)
     pub load_guards: Option<LoadGuards>,
 
+    // Decrement-only guard for the kv_centric prefill in-flight reservation.
+    // Incremented at selection inside KvCentricPolicy::select_worker; this guard
+    // (created in the worker-selection stage) releases it on context drop.
+    pub prefill_reservation: Option<PrefillReservationGuard>,
+
     // Stage 6: Response processing state
     pub response: ResponseState,
+}
+
+/// RAII reservation for the kv_centric prefill in-flight counter.
+///
+/// Created in the worker-selection stage for the chosen PREFILL worker only (so the
+/// decode-pool selection in PD mode never reserves a prefill slot). It INCREMENTS the
+/// worker's `prefill_inflight` on construction so concurrent routing decisions observe
+/// the added load immediately (this is what makes kv_centric distribute under bursts),
+/// and DECREMENTS it on drop. Tying both to one guard makes it leak-safe (always
+/// released on completion/abort) and retry-safe (overwriting the field drops the prior
+/// guard, releasing the previously-chosen worker).
+pub(crate) struct PrefillReservationGuard {
+    worker: Arc<dyn Worker>,
+}
+
+impl PrefillReservationGuard {
+    pub fn new(worker: Arc<dyn Worker>) -> Self {
+        worker.increment_prefill_inflight();
+        Self { worker }
+    }
+}
+
+impl Drop for PrefillReservationGuard {
+    fn drop(&mut self) {
+        // saturating: harmless if somehow decremented below 0
+        self.worker.decrement_prefill_inflight();
+    }
 }
 
 /// Output from preparation stage (Step 1)

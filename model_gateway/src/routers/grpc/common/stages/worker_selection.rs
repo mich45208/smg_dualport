@@ -4,18 +4,24 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{error, warn};
+use tracing::error;
+use tracing::warn;
 
 use super::PipelineStage;
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    policies::{PolicyRegistry, SelectWorkerInfo},
-    routers::{
-        error,
-        grpc::context::{RequestContext, WorkerSelection},
-    },
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
-};
+use crate::observability::metrics::Metrics;
+use crate::observability::metrics::metrics_labels;
+use crate::policies::PolicyRegistry;
+use crate::policies::SelectWorkerInfo;
+use crate::routers::error;
+use crate::routers::grpc::context::PrefillReservationGuard;
+use crate::routers::grpc::context::RequestContext;
+use crate::routers::grpc::context::WorkerSelection;
+use crate::worker::ConnectionMode;
+use crate::worker::RuntimeType;
+use crate::worker::UNKNOWN_MODEL_ID;
+use crate::worker::Worker;
+use crate::worker::WorkerRegistry;
+use crate::worker::WorkerType;
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
@@ -105,6 +111,15 @@ impl PipelineStage for WorkerSelectionStage {
                 }
             }
         };
+
+        // Attach a decrement-only guard for the kv_centric prefill in-flight
+        // reservation (incremented at selection inside select_worker). Releasing it on
+        // context drop makes the reservation leak-safe and retry-safe.
+        let reservation_worker = match &workers {
+            WorkerSelection::Single { worker } => worker.clone(),
+            WorkerSelection::Dual { prefill, .. } => prefill.clone(),
+        };
+        ctx.state.prefill_reservation = Some(PrefillReservationGuard::new(reservation_worker));
 
         ctx.state.workers = Some(workers);
         Ok(None)
@@ -238,9 +253,7 @@ impl WorkerSelectionStage {
         if prefill_mixed || decode_mixed {
             warn!(
                 "Mixed runtime types in PD workers (prefill_mixed={}, decode_mixed={}). Using {:?}.",
-                prefill_mixed,
-                decode_mixed,
-                first_runtime
+                prefill_mixed, decode_mixed, first_runtime
             );
         }
 

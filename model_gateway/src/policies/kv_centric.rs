@@ -310,6 +310,12 @@ impl LoadBalancingPolicy for KvCentricPolicy {
         if healthy_indices.is_empty() {
             return None;
         }
+
+        // NOTE: the prefill in-flight reservation is INCREMENTED by the
+        // PrefillReservationGuard created in the worker-selection stage (for the chosen
+        // prefill worker only), and released on context drop. We must NOT increment here
+        // because in PD mode select_worker is also invoked on the DECODE pool, which must
+        // not reserve a prefill slot. Here we only READ prefill_inflight() as queue depth.
         if healthy_indices.len() == 1 {
             return Some(healthy_indices[0]);
         }
@@ -320,7 +326,7 @@ impl LoadBalancingPolicy for KvCentricPolicy {
                 return healthy_indices
                     .iter()
                     .copied()
-                    .min_by_key(|&idx| workers[idx].load());
+                    .min_by_key(|&idx| workers[idx].prefill_inflight());
             }
         };
 
@@ -333,7 +339,7 @@ impl LoadBalancingPolicy for KvCentricPolicy {
                 return healthy_indices
                     .iter()
                     .copied()
-                    .min_by_key(|&idx| workers[idx].load());
+                    .min_by_key(|&idx| workers[idx].prefill_inflight());
             }
         };
 
@@ -344,7 +350,7 @@ impl LoadBalancingPolicy for KvCentricPolicy {
                 return healthy_indices
                     .iter()
                     .copied()
-                    .min_by_key(|&idx| workers[idx].load());
+                    .min_by_key(|&idx| workers[idx].prefill_inflight());
             }
         };
 
@@ -372,7 +378,9 @@ impl LoadBalancingPolicy for KvCentricPolicy {
         let mut best_estimate: Option<TtftEstimate> = None;
 
         for (pos, &idx) in healthy_indices.iter().enumerate() {
-            let queue_depth = workers[idx].load();
+            // queue depth = requests already assigned to this prefill that haven't left
+            // prefill yet (queue + executing). Reserved at selection, released at prefill exit.
+            let queue_depth = workers[idx].prefill_inflight();
             let estimate = self.estimate_ttft(
                 prompt_tokens,
                 local_cached[pos],
