@@ -286,8 +286,14 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
+        // Select decode FIRST, then prefill. For kv_centric, the prefill selection
+        // RESERVES a prefill in-flight slot (increment) as part of the decision; the
+        // matching release is the PrefillReservationGuard the execute() stage creates
+        // for the chosen prefill worker. Doing prefill last means if decode selection
+        // fails (returns None via `?`) we bail out before reserving, so no slot leaks.
+        // (Decode selection never reserves a prefill slot — Decode workers are skipped.)
         let decode_idx = policy.select_worker(&available_decode, &info)?;
+        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
 
         let model = model_id;
         let policy_name = policy.name();

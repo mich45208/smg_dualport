@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
 
 use kv_index::compute_request_content_hashes;
@@ -12,6 +13,7 @@ use super::SelectWorkerInfo;
 use super::get_healthy_worker_indices;
 use crate::worker::KvEventMonitor;
 use crate::worker::Worker;
+use crate::worker::WorkerType;
 
 /// Env var pointing to a JSON file of coefficient overrides. When set (e.g. to a
 /// mounted k8s ConfigMap path), the values in that file override the compiled /
@@ -199,6 +201,13 @@ struct TtftEstimate {
 pub struct KvCentricPolicy {
     config: KvCentricConfig,
     kv_monitor: RwLock<Option<Arc<KvEventMonitor>>>,
+    /// Serializes the decision-and-reserve critical section in `select_worker` so
+    /// that concurrent selections observe each other's prefill in-flight reservation.
+    /// Without this, a simultaneous burst all reads `prefill_inflight()==0` before any
+    /// reservation lands and herds onto the cache owner (cold-start concentration).
+    /// The expensive cache-overlap hashing is done OUTSIDE this lock; the locked
+    /// section is only N atomic reads + argmin + one increment (sub-microsecond).
+    select_lock: Mutex<()>,
 }
 
 impl KvCentricPolicy {
@@ -220,11 +229,25 @@ impl KvCentricPolicy {
         Self {
             config,
             kv_monitor: RwLock::new(None),
+            select_lock: Mutex::new(()),
         }
     }
 
     pub fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
         *self.kv_monitor.write().unwrap() = monitor;
+    }
+
+    /// Reserve a prefill in-flight slot on the chosen worker, IF it performs prefill
+    /// compute — i.e. a Prefill worker in PD mode, or a Regular worker in a
+    /// non-disaggregated deployment. Decode-pool selections in PD mode must NOT reserve
+    /// a prefill slot, so Decode workers are skipped. The matching RELEASE is the
+    /// `PrefillReservationGuard` the grpc worker-selection stage creates for the chosen
+    /// prefill worker. Callers reserving from a multi-candidate decision hold
+    /// `select_lock` so the read→reserve is atomic across concurrent selections.
+    fn reserve_compute_slot(&self, workers: &[Arc<dyn Worker>], idx: usize) {
+        if !matches!(workers[idx].worker_type(), WorkerType::Decode) {
+            workers[idx].increment_prefill_inflight();
+        }
     }
 
     /// Load-aware compute time: max of the isolated (attention-bound) cost and
@@ -304,6 +327,15 @@ impl KvCentricPolicy {
     }
 }
 
+/// Per-worker cache overlap snapshot, computed (lock-free) before the reservation
+/// critical section. `local_cached[i]` aligns with the i-th healthy worker index.
+struct CacheModel {
+    prompt_tokens: usize,
+    block_size: usize,
+    local_cached: Vec<u32>,
+    best_cached_blocks: u32,
+}
+
 impl LoadBalancingPolicy for KvCentricPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
@@ -311,107 +343,118 @@ impl LoadBalancingPolicy for KvCentricPolicy {
             return None;
         }
 
-        // NOTE: the prefill in-flight reservation is INCREMENTED by the
-        // PrefillReservationGuard created in the worker-selection stage (for the chosen
-        // prefill worker only), and released on context drop. We must NOT increment here
-        // because in PD mode select_worker is also invoked on the DECODE pool, which must
-        // not reserve a prefill slot. Here we only READ prefill_inflight() as queue depth.
+        // Single candidate: no decision, no race — just reserve and return.
         if healthy_indices.len() == 1 {
-            return Some(healthy_indices[0]);
+            let idx = healthy_indices[0];
+            self.reserve_compute_slot(workers, idx);
+            return Some(idx);
         }
 
-        let tokens = match info.tokens {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                return healthy_indices
-                    .iter()
-                    .copied()
-                    .min_by_key(|&idx| workers[idx].prefill_inflight());
+        // ---- Cache overlap (read-only w.r.t. reservation state) — computed WITHOUT the
+        // selection lock so the expensive hashing/lookup never serializes. Yields None
+        // when the cost model can't apply (no tokens / monitor / indexer); we then fall
+        // back to least-loaded. The kv_monitor read lock is released at the end of this
+        // block, before select_lock is acquired (no nested locking).
+        let cache: Option<CacheModel> = (|| {
+            let tokens = match info.tokens {
+                Some(t) if !t.is_empty() => t,
+                _ => return None,
+            };
+            let monitor_guard = self.kv_monitor.read().unwrap();
+            let monitor = monitor_guard.as_ref()?;
+            let model_id = workers[healthy_indices[0]].model_id();
+            let indexer = monitor.get_indexer(model_id)?;
+            let block_size = monitor
+                .block_size(model_id)
+                .unwrap_or(self.config.block_size);
+            let content_hashes = compute_request_content_hashes(tokens, block_size);
+            let overlap = indexer.find_matches(&content_hashes, false);
+
+            // Per-worker local match + cluster-best match (the best is reachable via L3
+            // write-through, so any worker can in principle pull up to best_cached).
+            let mut local_cached: Vec<u32> = Vec::with_capacity(healthy_indices.len());
+            let mut best_cached_blocks = 0u32;
+            for &idx in &healthy_indices {
+                let cached = indexer
+                    .worker_id(workers[idx].url())
+                    .and_then(|wid| overlap.scores.get(&wid).copied())
+                    .unwrap_or(0);
+                best_cached_blocks = best_cached_blocks.max(cached);
+                local_cached.push(cached);
             }
-        };
-
-        let prompt_tokens = tokens.len();
-
-        let monitor_guard = self.kv_monitor.read().unwrap();
-        let monitor = match monitor_guard.as_ref() {
-            Some(m) => m,
-            None => {
-                return healthy_indices
-                    .iter()
-                    .copied()
-                    .min_by_key(|&idx| workers[idx].prefill_inflight());
-            }
-        };
-
-        let model_id = workers[healthy_indices[0]].model_id();
-        let indexer = match monitor.get_indexer(model_id) {
-            Some(idx) => idx,
-            None => {
-                return healthy_indices
-                    .iter()
-                    .copied()
-                    .min_by_key(|&idx| workers[idx].prefill_inflight());
-            }
-        };
-
-        let block_size = monitor
-            .block_size(model_id)
-            .unwrap_or(self.config.block_size);
-        let content_hashes = compute_request_content_hashes(tokens, block_size);
-        let overlap = indexer.find_matches(&content_hashes, false);
-
-        // Per-worker local match + cluster-best match (the best is reachable via L3
-        // write-through, so any worker can in principle pull up to best_cached).
-        let mut local_cached: Vec<u32> = Vec::with_capacity(healthy_indices.len());
-        let mut best_cached_blocks = 0u32;
-        for &idx in &healthy_indices {
-            let cached = indexer
-                .worker_id(workers[idx].url())
-                .and_then(|wid| overlap.scores.get(&wid).copied())
-                .unwrap_or(0);
-            best_cached_blocks = best_cached_blocks.max(cached);
-            local_cached.push(cached);
-        }
-
-        let mut best_idx = healthy_indices[0];
-        let mut best_ttft = f64::MAX;
-        let mut best_estimate: Option<TtftEstimate> = None;
-
-        for (pos, &idx) in healthy_indices.iter().enumerate() {
-            // queue depth = requests already assigned to this prefill that haven't left
-            // prefill yet (queue + executing). Reserved at selection, released at prefill exit.
-            let queue_depth = workers[idx].prefill_inflight();
-            let estimate = self.estimate_ttft(
-                prompt_tokens,
-                local_cached[pos],
-                best_cached_blocks,
-                queue_depth,
+            Some(CacheModel {
+                prompt_tokens: tokens.len(),
                 block_size,
-            );
-            if estimate.ttft_ms < best_ttft {
-                best_ttft = estimate.ttft_ms;
-                best_idx = idx;
-                best_estimate = Some(estimate);
+                local_cached,
+                best_cached_blocks,
+            })
+        })();
+
+        // ---- Decision + reservation critical section. Serialized so a concurrent burst
+        // observes each prior reservation, instead of every selection reading
+        // prefill_inflight()==0 and herding onto the cache owner. The body is only N
+        // atomic reads + argmin + one increment (sub-microsecond); the hashing above ran
+        // outside this lock.
+        let _sel = self.select_lock.lock().unwrap();
+
+        let best_pos = match &cache {
+            Some(cm) => {
+                let mut best_pos = 0usize;
+                let mut best_ttft = f64::MAX;
+                let mut best_estimate: Option<TtftEstimate> = None;
+                for (pos, &idx) in healthy_indices.iter().enumerate() {
+                    // queue depth = requests reserved on this prefill that haven't left
+                    // prefill yet (queue + executing). Reserved here, released at drop.
+                    let queue_depth = workers[idx].prefill_inflight();
+                    let estimate = self.estimate_ttft(
+                        cm.prompt_tokens,
+                        cm.local_cached[pos],
+                        cm.best_cached_blocks,
+                        queue_depth,
+                        cm.block_size,
+                    );
+                    if estimate.ttft_ms < best_ttft {
+                        best_ttft = estimate.ttft_ms;
+                        best_pos = pos;
+                        best_estimate = Some(estimate);
+                    }
+                }
+                if let Some(est) = &best_estimate {
+                    debug!(
+                        "KvCentric: selected worker={} ttft={:.1}ms \
+                         (compute={:.1}ms transfer={:.1}ms c={}) \
+                         local_cached={}blk pulled={}tok new={}tok prompt={}tok",
+                        workers[healthy_indices[best_pos]].url(),
+                        est.ttft_ms,
+                        est.compute_ms,
+                        est.transfer_ms,
+                        est.concurrency,
+                        est.local_cached_blocks,
+                        est.pulled_tokens,
+                        est.new_tokens,
+                        cm.prompt_tokens,
+                    );
+                }
+                best_pos
             }
-        }
+            None => {
+                // Fallback: least prefill-loaded worker (still under the lock so the
+                // read→reserve stays atomic).
+                let mut best_pos = 0usize;
+                let mut best_load = usize::MAX;
+                for (pos, &idx) in healthy_indices.iter().enumerate() {
+                    let load = workers[idx].prefill_inflight();
+                    if load < best_load {
+                        best_load = load;
+                        best_pos = pos;
+                    }
+                }
+                best_pos
+            }
+        };
 
-        if let Some(est) = &best_estimate {
-            debug!(
-                "KvCentric: selected worker={} ttft={:.1}ms \
-                 (compute={:.1}ms transfer={:.1}ms c={}) \
-                 local_cached={}blk pulled={}tok new={}tok prompt={}tok",
-                workers[best_idx].url(),
-                est.ttft_ms,
-                est.compute_ms,
-                est.transfer_ms,
-                est.concurrency,
-                est.local_cached_blocks,
-                est.pulled_tokens,
-                est.new_tokens,
-                prompt_tokens,
-            );
-        }
-
+        let best_idx = healthy_indices[best_pos];
+        self.reserve_compute_slot(workers, best_idx);
         Some(best_idx)
     }
 

@@ -141,22 +141,21 @@ pub(crate) struct ProcessingState {
     pub response: ResponseState,
 }
 
-/// RAII reservation for the kv_centric prefill in-flight counter.
+/// RAII RELEASE for the kv_centric prefill in-flight counter.
 ///
-/// Created in the worker-selection stage for the chosen PREFILL worker only (so the
-/// decode-pool selection in PD mode never reserves a prefill slot). It INCREMENTS the
-/// worker's `prefill_inflight` on construction so concurrent routing decisions observe
-/// the added load immediately (this is what makes kv_centric distribute under bursts),
-/// and DECREMENTS it on drop. Tying both to one guard makes it leak-safe (always
-/// released on completion/abort) and retry-safe (overwriting the field drops the prior
-/// guard, releasing the previously-chosen worker).
+/// The slot is RESERVED (incremented) atomically with the decision inside
+/// `KvCentricPolicy::select_worker` — that is what makes concurrent routing decisions
+/// observe the added load immediately and stops cold-start herding onto the cache owner.
+/// This guard owns the matching RELEASE: created in the worker-selection stage for the
+/// chosen PREFILL worker only, it DECREMENTS `prefill_inflight` on drop. Tying the
+/// release to a guard makes it leak-safe (always released on completion/abort) and
+/// retry-safe (overwriting the field drops the prior guard, releasing the prior worker).
 pub(crate) struct PrefillReservationGuard {
     worker: Arc<dyn Worker>,
 }
 
 impl PrefillReservationGuard {
     pub fn new(worker: Arc<dyn Worker>) -> Self {
-        worker.increment_prefill_inflight();
         Self { worker }
     }
 }
