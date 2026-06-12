@@ -270,9 +270,8 @@ pub(crate) struct DispatchMetadata {
     pub weight_version: Option<String>,
 }
 
-/// Load guards for worker load tracking
-/// Automatically decrements load when dropped
-pub(crate) enum LoadGuards {
+/// Worker dispatch-load guards (increment `load()` on create, decrement on drop).
+enum LoadGuardKind {
     Single {
         _guard: WorkerLoadGuard,
     },
@@ -282,19 +281,46 @@ pub(crate) enum LoadGuards {
     },
 }
 
+/// Load guards for worker load tracking. Automatically decrements load when dropped.
+///
+/// Also carries the kv_centric `PrefillReservationGuard`: the prefill in-flight slot is
+/// reserved at SELECTION time (so concurrent selections see it), but it must be RELEASED
+/// at request completion, not when `RequestContext` drops. For streaming requests `ctx`
+/// drops right after dispatch (load_guards are `take()`n into the stream to outlive it),
+/// so a reservation left in `ctx.state` would be released ~immediately and never reflect
+/// in-flight load. Bundling it here gives it the same full-request lifecycle as `load()`.
+pub(crate) struct LoadGuards {
+    _kind: LoadGuardKind,
+    _prefill_reservation: Option<PrefillReservationGuard>,
+}
+
 impl LoadGuards {
     pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
-        match selection {
-            WorkerSelection::Single { worker } => LoadGuards::Single {
+        let kind = match selection {
+            WorkerSelection::Single { worker } => LoadGuardKind::Single {
                 _guard: WorkerLoadGuard::new(worker.clone(), headers),
             },
             WorkerSelection::Dual {
                 prefill, decode, ..
-            } => LoadGuards::Dual {
+            } => LoadGuardKind::Dual {
                 _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
                 _decode: WorkerLoadGuard::new(decode.clone(), headers),
             },
+        };
+        LoadGuards {
+            _kind: kind,
+            _prefill_reservation: None,
         }
+    }
+
+    /// Attach the prefill in-flight reservation (created at worker selection) so it shares
+    /// the load-guard lifecycle and is released only when the request fully completes.
+    pub fn with_prefill_reservation(
+        mut self,
+        reservation: Option<PrefillReservationGuard>,
+    ) -> Self {
+        self._prefill_reservation = reservation;
+        self
     }
 }
 

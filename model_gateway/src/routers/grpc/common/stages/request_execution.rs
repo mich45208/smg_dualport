@@ -2,22 +2,27 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{debug, error, info_span, Instrument};
+use tracing::Instrument;
+use tracing::debug;
+use tracing::error;
+use tracing::info_span;
 
 use super::PipelineStage;
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::{
-                ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection,
-            },
-            proto_wrapper::{ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoStream},
-            utils::tonic_ext::{TonicResultExt, TonicStatusExt},
-        },
-    },
-    worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR},
-};
+use crate::routers::error;
+use crate::routers::grpc::context::ClientSelection;
+use crate::routers::grpc::context::ExecutionResult;
+use crate::routers::grpc::context::LoadGuards;
+use crate::routers::grpc::context::RequestContext;
+use crate::routers::grpc::context::WorkerSelection;
+use crate::routers::grpc::proto_wrapper::ProtoEmbedRequest;
+use crate::routers::grpc::proto_wrapper::ProtoGenerateRequest;
+use crate::routers::grpc::proto_wrapper::ProtoRequest;
+use crate::routers::grpc::proto_wrapper::ProtoStream;
+use crate::routers::grpc::utils::tonic_ext::TonicResultExt;
+use crate::routers::grpc::utils::tonic_ext::TonicStatusExt;
+use crate::worker::DEFAULT_BOOTSTRAP_PORT;
+use crate::worker::MOONCAKE_CONNECTOR;
+use crate::worker::RuntimeType;
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
 
@@ -62,8 +67,13 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
-        // Create load guards for worker load tracking (increment load when created)
-        // They will be automatically dropped (and decrement load) when RequestContext is dropped
+        // Create load guards for worker load tracking (increment load when created).
+        // Dropped (and decrement load) when the request completes — for streaming, the
+        // guards are take()n into the stream so they outlive RequestContext.
+        // Move the kv_centric prefill reservation (incremented at selection) into the load
+        // guards so it shares this full-request lifecycle instead of being released early
+        // when ctx drops at stream handoff.
+        let prefill_reservation = ctx.state.prefill_reservation.take();
         let workers = ctx.state.workers.as_ref().ok_or_else(|| {
             error!(
                 function = "RequestExecutionStage::execute",
@@ -75,7 +85,10 @@ impl PipelineStage for RequestExecutionStage {
             )
         })?;
 
-        ctx.state.load_guards = Some(LoadGuards::new(workers, ctx.input.headers.as_ref()));
+        ctx.state.load_guards = Some(
+            LoadGuards::new(workers, ctx.input.headers.as_ref())
+                .with_prefill_reservation(prefill_reservation),
+        );
 
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();
