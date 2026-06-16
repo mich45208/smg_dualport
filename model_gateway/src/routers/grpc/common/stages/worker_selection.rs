@@ -274,8 +274,16 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Select using policies
-        let policy = self.policy_registry.get_policy_or_default(model_id);
+        // Select using SEPARATE prefill and decode policies. The prefill pool uses the
+        // prefill (default) policy — e.g. kv_centric — which carries the cache/in-flight
+        // signal; the decode pool uses the configured --decode-policy (e.g. round_robin)
+        // so decode load is spread independently. Previously a single default policy was
+        // applied to both pools, which made kv_centric (no decode-side cache signal)
+        // concentrate all decode traffic on worker[0]. (The HTTP PD router already does
+        // this; this brings the gRPC PD path in line.) The KV-event monitor is propagated
+        // to all policy instances by the registry, so prefill keeps its cache awareness.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
@@ -292,24 +300,23 @@ impl WorkerSelectionStage {
         // for the chosen prefill worker. Doing prefill last means if decode selection
         // fails (returns None via `?`) we bail out before reserving, so no slot leaks.
         // (Decode selection never reserves a prefill slot — Decode workers are skipped.)
-        let decode_idx = policy.select_worker(&available_decode, &info)?;
-        let prefill_idx = policy.select_worker(&available_prefill, &info)?;
+        let decode_idx = decode_policy.select_worker(&available_decode, &info)?;
+        let prefill_idx = prefill_policy.select_worker(&available_prefill, &info)?;
 
         let model = model_id;
-        let policy_name = policy.name();
 
         // Record worker selection metrics for both prefill and decode
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            prefill_policy.name(),
         );
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            decode_policy.name(),
         );
 
         Some((
